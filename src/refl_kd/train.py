@@ -179,6 +179,7 @@ def eval_code(code: str, tests):
     return score, raw
 
 
+# replace the whole function with this
 @torch.no_grad()
 def mini_eval_student(model, tok, problems_subset, max_new_tokens=320):
     """
@@ -197,8 +198,10 @@ def mini_eval_student(model, tok, problems_subset, max_new_tokens=320):
             max_new_tokens=max_new_tokens,
             eos_token_id=tok.eos_token_id,
             pad_token_id=tok.pad_token_id,
+            return_dict_in_generate=True,         # <-- ensure dict
         )
-        code = tok.decode(out.sequences[0], skip_special_tokens=True)
+        seq = out.sequences if hasattr(out, "sequences") else out  # fallback if it's a tensor
+        code = tok.decode(seq[0], skip_special_tokens=True)
         R, _ = eval_code(code, pb.tests)
         hits += 1 if R > 0 else 0
     return hits / len(problems_subset)
