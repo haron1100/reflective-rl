@@ -1,6 +1,6 @@
 # src/refl_kd/train.py
 import argparse, os, csv, time, math, random
-from typing import List, Tuple
+from typing import List
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -55,7 +55,6 @@ def gen_with_scores(model, tok, prompt: str, max_new_tokens: int, temperature: f
     if full_ids.shape[0] <= prompt_len:
         return "", [], torch.empty((1, 0), dtype=torch.long, device=model.device)
     gen_ids = full_ids[prompt_len:].unsqueeze(0)
-    # slice step logits for this (single) sample
     T = gen_ids.shape[1]
     scores_1 = [out.scores[t][0:1, :].contiguous() for t in range(T)]
     gen_text = tok.decode(gen_ids[0], skip_special_tokens=True)
@@ -66,7 +65,6 @@ def gen_with_scores(model, tok, prompt: str, max_new_tokens: int, temperature: f
 def gen_batch_texts(model, tok, prompts: List[str], max_new_tokens: int, temperature: float) -> List[str]:
     """
     Batched generation (no scores). Used for reflections (we don't need scores there).
-    Returns list of decoded generated tails per prompt.
     """
     if not prompts:
         return []
@@ -82,9 +80,9 @@ def gen_batch_texts(model, tok, prompts: List[str], max_new_tokens: int, tempera
     )
     batch = tok(prompts, return_tensors="pt", padding=True).to(model.device)
     attn = batch["attention_mask"]
-    prompt_lens = attn.sum(dim=1)  # [B]
+    prompt_lens = attn.sum(dim=1)
     out = model.generate(**batch, generation_config=gc, logits_processor=LogitsProcessorList([SanitizeLogits()]))
-    seq = out.sequences  # [B, prompt_len + gen_len_max]
+    seq = out.sequences
     texts = []
     for i in range(seq.size(0)):
         tail = seq[i, prompt_lens[i].item():]
@@ -115,16 +113,13 @@ def gen_batch_with_scores(model, tok, prompts: List[str], max_new_tokens: int, t
     )
     batch = tok(prompts, return_tensors="pt", padding=True).to(model.device)
     attn = batch["attention_mask"]
-    prompt_lens = attn.sum(dim=1)  # [B]
+    prompt_lens = attn.sum(dim=1)
     out = model.generate(**batch, generation_config=gc, logits_processor=LogitsProcessorList([SanitizeLogits()]))
 
     seq = out.sequences
     B = seq.size(0)
-    texts: List[str] = []
-    per_sample_scores: List[List[torch.Tensor]] = []
-    per_sample_gen_ids: List[torch.Tensor] = []
+    texts, per_sample_scores, per_sample_gen_ids = [], [], []
 
-    # compute generated lengths per sample
     total_len = seq.size(1)
     gen_lens = [int(total_len - prompt_lens[i].item()) for i in range(B)]
 
@@ -134,7 +129,6 @@ def gen_batch_with_scores(model, tok, prompts: List[str], max_new_tokens: int, t
         T_i = gen_lens[i]
         scores_i = []
         for t in range(T_i):
-            # out.scores[t] is [B, V]; take row i, keep shape [1, V]
             scores_i.append(out.scores[t][i:i+1, :].contiguous())
         text_i = tok.decode(gen_ids_i[0], skip_special_tokens=True)
         texts.append(text_i)
@@ -185,7 +179,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--shuffle", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--bettertransformer", action="store_true", help="try FasterTransformer path if available")
+    ap.add_argument("--bettertransformer", action="store_true",
+                    help="speed up generation only; training will auto-revert to standard transformer")
     # instrumentation options
     ap.add_argument("--metrics_csv", type=str, default="./checkpoints/train_metrics.csv")
     ap.add_argument("--eval_every", type=int, default=10, help="mini-eval frequency (problems)")
@@ -218,24 +213,37 @@ def main():
     # ---- Data ----
     if args.dataset != "mbpp":
         raise ValueError("Only 'mbpp' is supported in this minimal repo.")
-    # Load a bit extra so we can carve a tiny validation slice
     problems_all = load_mbpp(limit=cfg.max_problems + max(args.val_size, 0))
     problems = problems_all[: cfg.max_problems]
     val_subset = problems_all[cfg.max_problems : cfg.max_problems + args.val_size] if args.val_size > 0 else []
 
     # ---- Model & adapters ----
     model, tok = load_model_tokenizer(cfg.model_name, device=cfg.device)
-    # Try a faster inference path (safe fallback)
-    if args.bettertransformer:
-        try:
-            model = model.to_bettertransformer()
-            print("Using BetterTransformer fast path.")
-        except Exception:
-            pass
-
     model = add_lora_adapters(model)  # default adapter == student; also adds 'reflector'
 
-    # Separate optimizers per adapter
+    # Track BetterTransformer state (we toggle it around generation vs training)
+    bt_enabled = bool(args.bettertransformer)
+    bt_active = False
+    def enable_bt():
+        nonlocal model, bt_active
+        if bt_enabled and not bt_active:
+            try:
+                model = model.to_bettertransformer()
+                bt_active = True
+                print("[BT] Enabled BetterTransformer for generation.")
+            except Exception:
+                pass
+    def disable_bt():
+        nonlocal model, bt_active
+        if bt_active:
+            try:
+                model = model.reverse_bettertransformer()
+                print("[BT] Reverted to standard transformer for training.")
+            except Exception:
+                pass
+            bt_active = False
+
+    # ---- Optimizers ----
     model.set_adapter("default")  # student
     opt_student = AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg.lr_student)
     model.set_adapter("reflector")
@@ -272,14 +280,14 @@ def main():
         for idx, pb in pbar:
             t0 = time.time()
 
-            # 1) Baseline attempt (student, no reflection)
+            # 1) Baseline attempt (student, no reflection)  [GENERATION -> allow BT]
+            enable_bt()
             model.set_adapter("default")
             base_prompt = pb.prompt + "\n# Write the function above."
             base_code, _, _ = gen_with_scores(model, tok, base_prompt, cfg.max_new_tokens_code, cfg.temp_code)
             R0, _ = eval_code(base_code, pb.tests)
 
-            # 2) K reflections (batched) + K retries (batched with scores)
-            #    This is the main speedup vs. generating K times serially.
+            # 2) K reflections (batched) + K retries (batched with scores) [GENERATION -> allow BT]
             model.set_adapter("reflector")
             refl_prompt = format_reflection_prompt(pb.prompt, R0)
             refl_prompts = [refl_prompt] * cfg.k_reflections
@@ -297,6 +305,9 @@ def main():
                 A_i = R_i - R0
                 cand.append((A_i, rtxt, ctext, t_scores, g_ids))
 
+            # >>> From here on we TRAIN (need grad). Ensure we are on standard transformer.
+            disable_bt()
+
             # 3) RL on reflections (advantage-weighted NLL, labels masked to reflection tokens)
             model.set_adapter("reflector")
             opt_refl.zero_grad(set_to_none=True)
@@ -311,7 +322,7 @@ def main():
                 attn = torch.ones_like(inp)
                 labels = inp.clone()
                 labels[:, :p_ids.shape[1]] = -100
-                out = model(input_ids=inp, attention_mask=attn, labels=labels)
+                out = model(input_ids=inp, attention_mask=attn, labels=labels)  # requires grad
                 nll = out.loss
                 w = max(min(float(A_i), 1.0), -1.0)  # clip
                 loss_refl_val = nll * (-w) if loss_refl_val is None else loss_refl_val + nll * (-w)
@@ -337,7 +348,7 @@ def main():
 
                     concat_ids = torch.cat([x_ids["input_ids"], y_ids], dim=1)
                     attn = torch.ones_like(concat_ids)
-                    out = model(input_ids=concat_ids, attention_mask=attn, labels=concat_ids)
+                    out = model(input_ids=concat_ids, attention_mask=attn, labels=concat_ids)  # requires grad
                     logits = out.logits[0, -y_ids.shape[1]:, :]
 
                     kd_loss = kd_kl_topk(logits.float(), teacher_topk)
@@ -352,7 +363,7 @@ def main():
             # ---- Update running stats & log row ----
             total_seen += 1
             A_best = best[0] if best else 0.0
-            R_best_num = max([c[0] + R0 for c in cand], default=R0)  # R_best numeric = R0 + max A
+            R_best_num = max([c[0] + R0 for c in cand], default=R0)
             if A_best > 0:
                 refl_help += 1
             if did_kd:
@@ -361,7 +372,6 @@ def main():
             sum_R0 += R0
             sum_Rbest += R_best_num
 
-            # CSV row
             refl_len = len(cand[0][1].split()) if cand else 0
             code_len = len((best[2] if best else base_code).split())
             secs = time.time() - t0
@@ -375,9 +385,12 @@ def main():
             ])
             csv_f.flush()
 
-            # Periodic mini-eval on held-out set
+            # Periodic mini-eval on held-out set (inference only)
             if args.eval_every > 0 and args.val_size > 0 and (idx + 1) % args.eval_every == 0:
+                # temporarily allow BT for validation gen; then revert again
+                enable_bt()
                 last_val = mini_eval_student(model, tok, val_subset, max_new_tokens=cfg.max_new_tokens_code)
+                disable_bt()
 
             # Update main bar postfix
             avg_A = sum_A / max(1, total_seen)
@@ -391,6 +404,9 @@ def main():
                 + (f" Val@{args.val_size}={last_val:.2f}" if last_val is not None else "")
             )
 
+        # make sure we exit the epoch on standard transformer (safest)
+        disable_bt()
+
     # Save adapters
     model.set_adapter("default")
     model.save_pretrained(os.path.join(cfg.save_dir, "student_adapter"))
@@ -398,7 +414,6 @@ def main():
     model.save_pretrained(os.path.join(cfg.save_dir, "reflector_adapter"))
     print("Saved adapters to", cfg.save_dir)
 
-    # Close CSV
     csv_f.close()
 
 
