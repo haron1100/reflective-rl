@@ -111,30 +111,50 @@ def gen_batch_with_scores(model, tok, prompts: List[str], max_new_tokens: int, t
         return_dict_in_generate=True,
         output_scores=True,
     )
+
     batch = tok(prompts, return_tensors="pt", padding=True).to(model.device)
-    attn = batch["attention_mask"]
-    prompt_lens = attn.sum(dim=1)
+    attn = batch["attention_mask"]                              # [B, prompt_len_padded]
+    prompt_lens = attn.sum(dim=1)                               # [B] true prompt lengths
     out = model.generate(**batch, generation_config=gc, logits_processor=LogitsProcessorList([SanitizeLogits()]))
 
-    seq = out.sequences
+    seq = out.sequences                                         # [B, L_total]
     B = seq.size(0)
-    texts, per_sample_scores, per_sample_gen_ids = [], [], []
+    T_max = len(out.scores)                                     # max steps generated across batch
 
-    total_len = seq.size(1)
-    gen_lens = [int(total_len - prompt_lens[i].item()) for i in range(B)]
+    texts: List[str] = []
+    per_sample_scores: List[List[torch.Tensor]] = []
+    per_sample_gen_ids: List[torch.Tensor] = []
+
+    pad_id = tok.pad_token_id
 
     for i in range(B):
-        start = prompt_lens[i].item()
-        gen_ids_i = seq[i, start:].unsqueeze(0)  # [1, T_i]
-        T_i = gen_lens[i]
-        scores_i = []
-        for t in range(T_i):
-            scores_i.append(out.scores[t][i:i+1, :].contiguous())
+        start = int(prompt_lens[i].item())
+        tail = seq[i, start:]                                   # [gen_len_i + pad...]
+        # Determine per-sample generated length T_i by cutting at first PAD after the prompt
+        if pad_id is not None and (tail == pad_id).any():
+            first_pad = (tail == pad_id).nonzero(as_tuple=True)[0][0].item()
+            T_i = first_pad
+        else:
+            T_i = tail.shape[0]
+        # Cap by the available number of score steps
+        T_i = min(T_i, T_max)
+        if T_i <= 0:
+            texts.append("")
+            per_sample_scores.append([])
+            per_sample_gen_ids.append(torch.empty((1, 0), dtype=torch.long, device=model.device))
+            continue
+
+        gen_ids_i = tail[:T_i].unsqueeze(0).contiguous()        # [1, T_i]
+        # Slice the per-step logits for THIS sample
+        scores_i = [out.scores[t][i:i+1, :].contiguous() for t in range(T_i)]
         text_i = tok.decode(gen_ids_i[0], skip_special_tokens=True)
+
         texts.append(text_i)
         per_sample_scores.append(scores_i)
         per_sample_gen_ids.append(gen_ids_i)
+
     return texts, per_sample_scores, per_sample_gen_ids
+
 
 
 def eval_code(code: str, tests):
@@ -219,6 +239,11 @@ def main():
 
     # ---- Model & adapters ----
     model, tok = load_model_tokenizer(cfg.model_name, device=cfg.device)
+    # NEW: decoder-only models should left-pad inputs for correct generation
+    if getattr(tok, "padding_side", None) != "left":
+        tok.padding_side = "left"
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
     model = add_lora_adapters(model)  # default adapter == student; also adds 'reflector'
 
     # Track BetterTransformer state (we toggle it around generation vs training)
