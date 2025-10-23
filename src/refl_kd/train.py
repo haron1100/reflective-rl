@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import GenerationConfig, LogitsProcessor, LogitsProcessorList
 from tqdm import tqdm, trange
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 from .utils import TrainCfg
 from .data import load_mbpp
@@ -14,13 +14,21 @@ from .prompts import format_reflection_prompt, format_retry_prompt
 from .evaluator import run_tests_simple
 from .models import load_model_tokenizer, add_lora_adapters
 from .kd import collect_teacher_topk, kd_kl_topk
+# put near the imports
 
 def eval_many_codes(codes, tests, timeout=7.0, workers=None):
-    workers = workers or max(os.cpu_count() or 2, 2)
-    def _one(code): 
-        s, _ = run_tests_simple(code, tests)
+    """
+    Run unit tests for a batch of candidate code strings in parallel using a ThreadPool.
+    Threads are fine here because each check runs a subprocess, so the GIL isn't a bottleneck.
+    Returns a list of floats (pass fractions).
+    """
+    workers = workers or min(8, os.cpu_count() or 2)
+
+    def _one(code):
+        s, _ = run_tests_simple(code, tests, timeout_sec=int(timeout))
         return s
-    with ProcessPoolExecutor(max_workers=workers, mp_context=None) as ex:
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         return list(ex.map(_one, codes))
 
 # ---- Logits sanitizer to prevent NaN/Inf sampling errors (e.g., on MPS) ----
