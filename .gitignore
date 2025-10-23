@@ -1,0 +1,71 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python bytecode / builds
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs / temp
+*.log
+logs/
+nohup.out
+*.out
+*.err
+tmp/
+temp/
+*.tmp
+
+# Checkpoints / model weights
+checkpoints/
+runs/
+artifacts/
+lightning_logs/
+wandb/
+mlruns/
+ray_results/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+
+# Datasets / caches (local)
+data/
+datasets/
+.cache/
+cache/
+hf_cache/
+.huggingface/
+
+# Evaluation artifacts
+eval_results/
+evalplus_results/
+humaneval_*.json
+mbpp*_results.json
+.pytest_cache/
+.coverage
+htmlcov/
+cov.xml
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
