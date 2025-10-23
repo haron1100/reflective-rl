@@ -69,3 +69,6 @@ cov.xml
 .idea/
 *.swp
 *.swo
+
+#data
+HumanEval.jsonl.gz
