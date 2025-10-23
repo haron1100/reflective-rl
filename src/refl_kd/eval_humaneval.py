@@ -1,6 +1,7 @@
 import argparse, os, json, urllib.request
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.utils.logging import set_verbosity_error
 from peft import PeftModel
 from tqdm import tqdm
 
@@ -29,9 +30,10 @@ def gen(model, tok, prompt, max_new_tokens=320):
     return tok.decode(out.sequences[0], skip_special_tokens=True)
 
 def main():
-    # Quiet warnings
+    # Quiet transformer verbosity + tokenizer threads
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    set_verbosity_error()
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True)
@@ -71,14 +73,17 @@ def main():
             f.write(json.dumps({"task_id": task_id, "completion": code}) + "\n")
 
     print("Evaluating (this may take a minute)...")
+    # IMPORTANT: your Kaggle install expects k to be a LIST
     results = evaluate_functional_correctness(
         sample_file=args.samples_out,
         problem_file=he_path,
-        k=args.passk,
+        k=[args.passk],
         timeout=7.0,
     )
+    # Extract the metric you asked for
+    key = f"pass@{args.passk}"
     print(json.dumps(results, indent=2))
-    print("pass@1:", results.get("pass@1"))
+    print("pass@1:" if args.passk == 1 else key + ":", results.get(key))
 
 if __name__ == "__main__":
     main()
