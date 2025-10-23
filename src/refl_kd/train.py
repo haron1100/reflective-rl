@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import GenerationConfig, LogitsProcessor, LogitsProcessorList
 from tqdm import tqdm, trange
+from concurrent.futures import ProcessPoolExecutor
 
 from .utils import TrainCfg
 from .data import load_mbpp
@@ -14,6 +15,13 @@ from .evaluator import run_tests_simple
 from .models import load_model_tokenizer, add_lora_adapters
 from .kd import collect_teacher_topk, kd_kl_topk
 
+def eval_many_codes(codes, tests, timeout=7.0, workers=None):
+    workers = workers or max(os.cpu_count() or 2, 2)
+    def _one(code): 
+        s, _ = run_tests_simple(code, tests)
+        return s
+    with ProcessPoolExecutor(max_workers=workers, mp_context=None) as ex:
+        return list(ex.map(_one, codes))
 
 # ---- Logits sanitizer to prevent NaN/Inf sampling errors (e.g., on MPS) ----
 class SanitizeLogits(LogitsProcessor):
@@ -324,9 +332,9 @@ def main():
                 model, tok, retry_prompts, cfg.max_new_tokens_code, cfg.temp_code
             )
 
+            scores_batch = eval_many_codes(code_texts, pb.tests, timeout=7.0, workers=min(8, os.cpu_count() or 2))
             cand = []
-            for rtxt, ctext, t_scores, g_ids in zip(reflections, code_texts, teacher_scores_batch, gen_ids_batch):
-                R_i, _ = eval_code(ctext, pb.tests)
+            for rtxt, ctext, R_i, t_scores, g_ids in zip(reflections, code_texts, scores_batch, teacher_scores_batch, gen_ids_batch):
                 A_i = R_i - R0
                 cand.append((A_i, rtxt, ctext, t_scores, g_ids))
 
