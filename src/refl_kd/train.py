@@ -25,7 +25,7 @@ class SanitizeLogits(LogitsProcessor):
         return scores.clamp(min=-self.clamp, max=self.clamp)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def gen_with_scores(model, tok, prompt: str, max_new_tokens: int, temperature: float):
     """
     Single-sample generator used for baseline (simple and clear).
@@ -61,7 +61,7 @@ def gen_with_scores(model, tok, prompt: str, max_new_tokens: int, temperature: f
     return gen_text, scores_1, gen_ids
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def gen_batch_texts(model, tok, prompts: List[str], max_new_tokens: int, temperature: float) -> List[str]:
     """
     Batched generation (no scores). Used for reflections (we don't need scores there).
@@ -90,7 +90,7 @@ def gen_batch_texts(model, tok, prompts: List[str], max_new_tokens: int, tempera
     return texts
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def gen_batch_with_scores(model, tok, prompts: List[str], max_new_tokens: int, temperature: float):
     """
     Batched generation that ALSO returns per-sample step logits and generated token ids.
@@ -143,7 +143,7 @@ def eval_code(code: str, tests):
     return score, raw
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def mini_eval_student(model, tok, problems_subset, max_new_tokens=320):
     """
     Quick validation: greedy student (no reflection) on a small held-out subset.
@@ -307,25 +307,27 @@ def main():
 
             # >>> From here on we TRAIN (need grad). Ensure we are on standard transformer.
             disable_bt()
+            model.train()
 
             # 3) RL on reflections (advantage-weighted NLL, labels masked to reflection tokens)
             model.set_adapter("reflector")
             opt_refl.zero_grad(set_to_none=True)
             loss_refl_val = None
-            for (A_i, reflection, _code_text, _scores, _gen_ids) in cand:
-                r_prompt = format_reflection_prompt(pb.prompt, R0)
-                p_ids = tok(r_prompt, return_tensors="pt").to(model.device)["input_ids"]
-                r_ids = tok(reflection, return_tensors="pt").to(model.device)["input_ids"]
-                if r_ids.shape[1] == 0:
-                    continue
-                inp = torch.cat([p_ids, r_ids], dim=1)
-                attn = torch.ones_like(inp)
-                labels = inp.clone()
-                labels[:, :p_ids.shape[1]] = -100
-                out = model(input_ids=inp, attention_mask=attn, labels=labels)  # requires grad
-                nll = out.loss
-                w = max(min(float(A_i), 1.0), -1.0)  # clip
-                loss_refl_val = nll * (-w) if loss_refl_val is None else loss_refl_val + nll * (-w)
+            with torch.enable_grad():
+                for (A_i, reflection, _code_text, _scores, _gen_ids) in cand:
+                    r_prompt = format_reflection_prompt(pb.prompt, R0)
+                    p_ids = tok(r_prompt, return_tensors="pt").to(model.device)["input_ids"]
+                    r_ids = tok(reflection, return_tensors="pt").to(model.device)["input_ids"]
+                    if r_ids.shape[1] == 0:
+                        continue
+                    inp = torch.cat([p_ids, r_ids], dim=1)
+                    attn = torch.ones_like(inp)
+                    labels = inp.clone()
+                    labels[:, :p_ids.shape[1]] = -100
+                    out = model(input_ids=inp, attention_mask=attn, labels=labels)  # requires grad
+                    nll = out.loss
+                    w = max(min(float(A_i), 1.0), -1.0)  # clip
+                    loss_refl_val = nll * (-w) if loss_refl_val is None else loss_refl_val + nll * (-w)
             if loss_refl_val is not None:
                 (loss_refl_val / max(len(cand), 1)).backward()
                 opt_refl.step()
@@ -335,30 +337,37 @@ def main():
             did_kd = False
             kd_loss_val = None
             sft_loss_val = None
+
             if best and best[0] >= cfg.tau_gate:
                 _A_best, _reflection, _code_text, teacher_scores, gen_ids = best
                 if gen_ids is not None and gen_ids.numel() > 0 and len(teacher_scores) > 0:
                     teacher_topk = collect_teacher_topk(teacher_scores, topk=cfg.topk_kd)
 
                     model.set_adapter("default")
+                    model.train()                                      # <<< explicit
                     opt_student.zero_grad(set_to_none=True)
 
                     x_ids = tok(pb.prompt + "\n# Write the function above.", return_tensors="pt").to(model.device)
-                    y_ids = gen_ids.to(model.device)
+                    y_ids = gen_ids.to(model.device)                   # [1, T]
 
                     concat_ids = torch.cat([x_ids["input_ids"], y_ids], dim=1)
                     attn = torch.ones_like(concat_ids)
-                    out = model(input_ids=concat_ids, attention_mask=attn, labels=concat_ids)  # requires grad
-                    logits = out.logits[0, -y_ids.shape[1]:, :]
 
-                    kd_loss = kd_kl_topk(logits.float(), teacher_topk)
-                    sft_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_ids[0], ignore_index=-100)
-                    total_loss = cfg.kd_weight * kd_loss + cfg.sft_weight * sft_loss
+                    with torch.enable_grad():                          # <<< added
+                        out = model(input_ids=concat_ids, attention_mask=attn, labels=concat_ids)
+                        # clone to avoid "inference tensor" in backward
+                        logits = out.logits[0, -y_ids.shape[1]:, :].contiguous().clone()   # <<< clone
+
+                        kd_loss = kd_kl_topk(logits.float(), teacher_topk)
+                        sft_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_ids[0], ignore_index=-100)
+                        total_loss = cfg.kd_weight * kd_loss + cfg.sft_weight * sft_loss
+
                     total_loss.backward()
                     opt_student.step()
                     did_kd = True
                     kd_loss_val = float(kd_loss.detach())
                     sft_loss_val = float(sft_loss.detach())
+
 
             # ---- Update running stats & log row ----
             total_seen += 1
