@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import GenerationConfig, LogitsProcessor, LogitsProcessorList
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 from .utils import TrainCfg
 from .data import load_mbpp
@@ -120,7 +120,7 @@ def main():
 
         # 2) Sample K reflections & retries (teacher runs with reflection in context)
         cand = []  # tuples: (A_i, reflection_text, code_text, teacher_scores, gen_ids)
-        for _ in range(cfg.k_reflections):
+        for _ in trange(cfg.k_reflections, desc="Reflections", leave=False, ncols=80):
             # Reflection (reflector adapter)
             model.set_adapter("reflector")
             refl_prompt = format_reflection_prompt(pb.prompt, R0)
