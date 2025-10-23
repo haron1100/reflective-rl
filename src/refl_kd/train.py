@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import GenerationConfig, LogitsProcessor, LogitsProcessorList
 from tqdm import tqdm, trange
+import random
 
 from .utils import TrainCfg
 from .data import load_mbpp
@@ -94,7 +95,10 @@ def main():
     ap.add_argument("--max_problems", type=int, default=200)
     ap.add_argument("--k_reflections", type=int, default=2)
     ap.add_argument("--save_dir", type=str, default="./checkpoints")
-    ap.add_argument("--device", type=str, default="cuda", help="cuda | mps | cpu")
+    ap.add_argument("--device", type=str, de
+                    fault="cuda", help="cuda | mps | cpu")
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--shuffle", action="store_true")
     # instrumentation options
     ap.add_argument("--metrics_csv", type=str, default="./checkpoints/train_metrics.csv")
     ap.add_argument("--eval_every", type=int, default=10, help="mini-eval frequency (problems)")
@@ -155,130 +159,135 @@ def main():
     last_val = None
 
     # ---- Training loop ----
-    pbar = tqdm(enumerate(problems), total=len(problems), desc="Train")
-    for idx, pb in pbar:
-        t0 = time.time()
+    for epoch in range(args.epochs):
+        if args.shuffle:
+            random.shuffle(problems)
 
-        # 1) Baseline attempt (student, no reflection)
-        model.set_adapter("default")
-        base_prompt = pb.prompt + "\n# Write the function above."
-        base_code, _, _ = gen_with_scores(model, tok, base_prompt, cfg.max_new_tokens_code, cfg.temp_code)
-        R0, _ = eval_code(base_code, pb.tests)
+        pbar = tqdm(enumerate(problems), total=len(problems),
+                    desc=f"Train e{epoch+1}/{args.epochs}")
+        for idx, pb in pbar:
+            t0 = time.time()
 
-        # 2) Sample K reflections & retries (teacher runs with reflection in context)
-        cand = []  # tuples: (A_i, reflection_text, code_text, teacher_scores, gen_ids)
-        ref_iter = trange(cfg.k_reflections, desc="Reflections", leave=False, ncols=80) if args.show_inner_bar else range(cfg.k_reflections)
-        for _ in ref_iter:
-            # Reflection (reflector adapter)
-            model.set_adapter("reflector")
-            refl_prompt = format_reflection_prompt(pb.prompt, R0)
-            reflection, _, _ = gen_with_scores(model, tok, refl_prompt, cfg.max_new_tokens_refl, cfg.temp_refl)
-
-            # Retry with reflection (teacher = same base weights, student adapter for generation)
+            # 1) Baseline attempt (student, no reflection)
             model.set_adapter("default")
-            retry_prompt = format_retry_prompt(pb.prompt, reflection)
-            code_text, teacher_scores, gen_ids = gen_with_scores(
-                model, tok, retry_prompt, cfg.max_new_tokens_code, cfg.temp_code
-            )
+            base_prompt = pb.prompt + "\n# Write the function above."
+            base_code, _, _ = gen_with_scores(model, tok, base_prompt, cfg.max_new_tokens_code, cfg.temp_code)
+            R0, _ = eval_code(base_code, pb.tests)
 
-            # Evaluate
-            R_i, _ = eval_code(code_text, pb.tests)
-            A_i = R_i - R0
-            cand.append((A_i, reflection, code_text, teacher_scores, gen_ids))
+            # 2) Sample K reflections & retries (teacher runs with reflection in context)
+            cand = []  # tuples: (A_i, reflection_text, code_text, teacher_scores, gen_ids)
+            ref_iter = trange(cfg.k_reflections, desc="Reflections", leave=False, ncols=80) if args.show_inner_bar else range(cfg.k_reflections)
+            for _ in ref_iter:
+                # Reflection (reflector adapter)
+                model.set_adapter("reflector")
+                refl_prompt = format_reflection_prompt(pb.prompt, R0)
+                reflection, _, _ = gen_with_scores(model, tok, refl_prompt, cfg.max_new_tokens_refl, cfg.temp_refl)
 
-        # 3) RL on reflections (advantage-weighted NLL, labels masked to reflection tokens)
-        model.set_adapter("reflector")
-        opt_refl.zero_grad(set_to_none=True)
-        loss_refl_val = None
-        for (A_i, reflection, _code_text, _scores, _gen_ids) in cand:
-            refl_prompt = format_reflection_prompt(pb.prompt, R0)
-            p_ids = tok(refl_prompt, return_tensors="pt").to(model.device)["input_ids"]    # prompt tokens
-            r_ids = tok(reflection, return_tensors="pt").to(model.device)["input_ids"]    # reflection tokens
-            if r_ids.shape[1] == 0:
-                continue
-            inp = torch.cat([p_ids, r_ids], dim=1)
-            attn = torch.ones_like(inp)
-            labels = inp.clone()
-            labels[:, :p_ids.shape[1]] = -100
-            out = model(input_ids=inp, attention_mask=attn, labels=labels)
-            nll = out.loss
-            w = max(min(float(A_i), 1.0), -1.0)
-            loss_refl_val = nll * (-w) if loss_refl_val is None else loss_refl_val + nll * (-w)
-        if loss_refl_val is not None:
-            (loss_refl_val / max(len(cand), 1)).backward()
-            opt_refl.step()
-
-        # 4) KD distillation (teacher-with-reflection → student-without), gated by advantage
-        best = max(cand, key=lambda x: x[0]) if cand else None
-        did_kd = False
-        kd_loss_val = None
-        sft_loss_val = None
-        if best and best[0] >= cfg.tau_gate:
-            _A_best, _reflection, _code_text, teacher_scores, gen_ids = best
-            if gen_ids is not None and gen_ids.numel() > 0 and len(teacher_scores) > 0:
-                teacher_topk = collect_teacher_topk(teacher_scores, topk=cfg.topk_kd)
+                # Retry with reflection (teacher = same base weights, student adapter for generation)
                 model.set_adapter("default")
-                opt_student.zero_grad(set_to_none=True)
+                retry_prompt = format_retry_prompt(pb.prompt, reflection)
+                code_text, teacher_scores, gen_ids = gen_with_scores(
+                    model, tok, retry_prompt, cfg.max_new_tokens_code, cfg.temp_code
+                )
 
-                x_ids = tok(pb.prompt + "\n# Write the function above.", return_tensors="pt").to(model.device)
-                y_ids = gen_ids.to(model.device)
+                # Evaluate
+                R_i, _ = eval_code(code_text, pb.tests)
+                A_i = R_i - R0
+                cand.append((A_i, reflection, code_text, teacher_scores, gen_ids))
 
-                concat_ids = torch.cat([x_ids["input_ids"], y_ids], dim=1)
-                attn = torch.ones_like(concat_ids)
-                out = model(input_ids=concat_ids, attention_mask=attn, labels=concat_ids)
-                logits = out.logits[0, -y_ids.shape[1]:, :]
+            # 3) RL on reflections (advantage-weighted NLL, labels masked to reflection tokens)
+            model.set_adapter("reflector")
+            opt_refl.zero_grad(set_to_none=True)
+            loss_refl_val = None
+            for (A_i, reflection, _code_text, _scores, _gen_ids) in cand:
+                refl_prompt = format_reflection_prompt(pb.prompt, R0)
+                p_ids = tok(refl_prompt, return_tensors="pt").to(model.device)["input_ids"]    # prompt tokens
+                r_ids = tok(reflection, return_tensors="pt").to(model.device)["input_ids"]    # reflection tokens
+                if r_ids.shape[1] == 0:
+                    continue
+                inp = torch.cat([p_ids, r_ids], dim=1)
+                attn = torch.ones_like(inp)
+                labels = inp.clone()
+                labels[:, :p_ids.shape[1]] = -100
+                out = model(input_ids=inp, attention_mask=attn, labels=labels)
+                nll = out.loss
+                w = max(min(float(A_i), 1.0), -1.0)
+                loss_refl_val = nll * (-w) if loss_refl_val is None else loss_refl_val + nll * (-w)
+            if loss_refl_val is not None:
+                (loss_refl_val / max(len(cand), 1)).backward()
+                opt_refl.step()
 
-                kd_loss = kd_kl_topk(logits.float(), teacher_topk)
-                sft_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_ids[0], ignore_index=-100)
-                total = cfg.kd_weight * kd_loss + cfg.sft_weight * sft_loss
-                total.backward()
-                opt_student.step()
-                did_kd = True
-                kd_loss_val = float(kd_loss.detach())
-                sft_loss_val = float(sft_loss.detach())
+            # 4) KD distillation (teacher-with-reflection → student-without), gated by advantage
+            best = max(cand, key=lambda x: x[0]) if cand else None
+            did_kd = False
+            kd_loss_val = None
+            sft_loss_val = None
+            if best and best[0] >= cfg.tau_gate:
+                _A_best, _reflection, _code_text, teacher_scores, gen_ids = best
+                if gen_ids is not None and gen_ids.numel() > 0 and len(teacher_scores) > 0:
+                    teacher_topk = collect_teacher_topk(teacher_scores, topk=cfg.topk_kd)
+                    model.set_adapter("default")
+                    opt_student.zero_grad(set_to_none=True)
 
-        # ---- Update running stats & log row ----
-        total += 1
-        R_best = best[2] if isinstance(best, tuple) else base_code  # we log the numeric below, not the text
-        A_best = best[0] if best else 0.0
-        R_best_num = max([c[0] + R0 for c in cand], default=R0)  # R_best numeric = R0 + max A
-        if A_best > 0:
-            refl_help += 1
-        if did_kd:
-            kd_yes += 1
-        sum_A += A_best
-        sum_R0 += R0
-        sum_Rbest += R_best_num
+                    x_ids = tok(pb.prompt + "\n# Write the function above.", return_tensors="pt").to(model.device)
+                    y_ids = gen_ids.to(model.device)
 
-        # CSV row
-        refl_len = len(cand[0][1].split()) if cand else 0
-        code_len = len((best[2] if best else base_code).split())
-        secs = time.time() - t0
-        csv_w.writerow([
-            idx, pb.pid, f"{R0:.2f}", f"{R_best_num:.2f}", f"{A_best:.2f}",
-            1 if did_kd else 0,
-            f"{float(loss_refl_val.detach()):.4f}" if loss_refl_val is not None else "",
-            f"{kd_loss_val:.4f}" if kd_loss_val is not None else "",
-            f"{sft_loss_val:.4f}" if sft_loss_val is not None else "",
-            refl_len, code_len, f"{secs:.2f}",
-        ])
-        csv_f.flush()
+                    concat_ids = torch.cat([x_ids["input_ids"], y_ids], dim=1)
+                    attn = torch.ones_like(concat_ids)
+                    out = model(input_ids=concat_ids, attention_mask=attn, labels=concat_ids)
+                    logits = out.logits[0, -y_ids.shape[1]:, :]
 
-        # Periodic mini-eval on held-out set
-        if args.eval_every > 0 and args.val_size > 0 and (idx + 1) % args.eval_every == 0:
-            last_val = mini_eval_student(model, tok, val_subset, max_new_tokens=cfg.max_new_tokens_code)
+                    kd_loss = kd_kl_topk(logits.float(), teacher_topk)
+                    sft_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_ids[0], ignore_index=-100)
+                    total = cfg.kd_weight * kd_loss + cfg.sft_weight * sft_loss
+                    total.backward()
+                    opt_student.step()
+                    did_kd = True
+                    kd_loss_val = float(kd_loss.detach())
+                    sft_loss_val = float(sft_loss.detach())
 
-        # Update main bar postfix
-        avg_A = sum_A / max(1, total)
-        help_rate = 100.0 * refl_help / max(1, total)
-        kd_rate = 100.0 * kd_yes / max(1, total)
-        avg_R0 = sum_R0 / max(1, total)
-        avg_Rbest = sum_Rbest / max(1, total)
-        pbar.set_postfix_str(
-            f"Aavg={avg_A:.2f} Help%={help_rate:.1f} KD%={kd_rate:.1f} "
-            f"R0avg={avg_R0:.2f} Rbestavg={avg_Rbest:.2f}"
-            + (f" Val@{args.val_size}={last_val:.2f}" if last_val is not None else "")
-        )
+            # ---- Update running stats & log row ----
+            total += 1
+            R_best = best[2] if isinstance(best, tuple) else base_code  # we log the numeric below, not the text
+            A_best = best[0] if best else 0.0
+            R_best_num = max([c[0] + R0 for c in cand], default=R0)  # R_best numeric = R0 + max A
+            if A_best > 0:
+                refl_help += 1
+            if did_kd:
+                kd_yes += 1
+            sum_A += A_best
+            sum_R0 += R0
+            sum_Rbest += R_best_num
+
+            # CSV row
+            refl_len = len(cand[0][1].split()) if cand else 0
+            code_len = len((best[2] if best else base_code).split())
+            secs = time.time() - t0
+            csv_w.writerow([
+                idx, pb.pid, f"{R0:.2f}", f"{R_best_num:.2f}", f"{A_best:.2f}",
+                1 if did_kd else 0,
+                f"{float(loss_refl_val.detach()):.4f}" if loss_refl_val is not None else "",
+                f"{kd_loss_val:.4f}" if kd_loss_val is not None else "",
+                f"{sft_loss_val:.4f}" if sft_loss_val is not None else "",
+                refl_len, code_len, f"{secs:.2f}",
+            ])
+            csv_f.flush()
+
+            # Periodic mini-eval on held-out set
+            if args.eval_every > 0 and args.val_size > 0 and (idx + 1) % args.eval_every == 0:
+                last_val = mini_eval_student(model, tok, val_subset, max_new_tokens=cfg.max_new_tokens_code)
+
+            # Update main bar postfix
+            avg_A = sum_A / max(1, total)
+            help_rate = 100.0 * refl_help / max(1, total)
+            kd_rate = 100.0 * kd_yes / max(1, total)
+            avg_R0 = sum_R0 / max(1, total)
+            avg_Rbest = sum_Rbest / max(1, total)
+            pbar.set_postfix_str(
+                f"Aavg={avg_A:.2f} Help%={help_rate:.1f} KD%={kd_rate:.1f} "
+                f"R0avg={avg_R0:.2f} Rbestavg={avg_Rbest:.2f}"
+                + (f" Val@{args.val_size}={last_val:.2f}" if last_val is not None else "")
+            )
 
     # Save adapters
     model.set_adapter("default")
